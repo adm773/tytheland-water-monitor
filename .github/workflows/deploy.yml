@@ -1,0 +1,118 @@
+name: Deploy to Apps Script
+
+# Every push to main that changes the script is checked and pushed to the live Apps Script
+# project. It can also be run by hand from the Actions tab.
+on:
+  push:
+    branches: [main]
+    paths: [Code.gs, appsscript.json, .clasp.json, .claspignore]
+  workflow_dispatch:
+    inputs:
+      overwrite_live_edits:
+        description: Deploy even if the live project was edited outside GitHub (those edits are lost)
+        type: boolean
+        default: false
+
+# One deploy at a time, in order.
+concurrency:
+  group: apps-script-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write # moves the "deployed" tag after a successful push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the "deployed" tag is needed for the live-edit check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check script syntax
+        run: |
+          cp Code.gs "$RUNNER_TEMP/Code.js"
+          node --check "$RUNNER_TEMP/Code.js"
+
+      - name: Install clasp
+        run: npm install -g @google/clasp@3.4.1
+
+      - name: Sign in to Google
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          if [ -z "$CLASPRC_JSON" ]; then
+            echo "::error::Repository secret CLASPRC_JSON is missing. See README → Automatic deployment."
+            exit 1
+          fi
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          chmod 600 ~/.clasprc.json
+
+      - name: Check the live project has no edits missing from GitHub
+        env:
+          OVERWRITE: ${{ inputs.overwrite_live_edits || false }}
+        run: |
+          set -euo pipefail
+          live="$RUNNER_TEMP/live"
+          mkdir -p "$live"
+          node -e '
+            const c = require("./.clasp.json");
+            require("fs").writeFileSync(process.argv[1], JSON.stringify({ scriptId: c.scriptId, rootDir: ".", scriptExtensions: [".gs"] }));
+          ' "$live/.clasp.json"
+          (cd "$live" && clasp pull)
+
+          problems=()
+
+          # Any other file in the live project would be deleted by the push.
+          extra=$(cd "$live" && find . -type f ! -name .clasp.json ! -name Code.gs ! -name appsscript.json -printf '%P ')
+          [ -z "$extra" ] || problems+=("Live project has files that are not in this repo and would be deleted: $extra")
+
+          # Live code must be what GitHub last deployed, or already what is being deployed.
+          # Whitespace-only differences don't count.
+          same_code() { diff -q -Z -B --strip-trailing-cr "$1" "$live/Code.gs" >/dev/null; }
+          # Until the first deploy has tagged a commit, the last deployed version is the repo's
+          # first commit: the script exactly as it was running before this repo existed.
+          if git rev-parse -q --verify refs/tags/deployed >/dev/null; then base=deployed
+          else base=$(git rev-list --max-parents=0 HEAD | tail -1); fi
+          echo "Comparing the live project with $base ($(git rev-parse --short "$base"))."
+          git show "$base:Code.gs" > "$RUNNER_TEMP/deployed.gs"
+          if ! same_code Code.gs && ! same_code "$RUNNER_TEMP/deployed.gs"; then
+            problems+=("Code.gs was edited in the Apps Script editor since the last deploy from GitHub.")
+            { echo '### Live Code.gs vs last deployed version'; echo '```diff';
+              diff -u -Z -B --strip-trailing-cr "$RUNNER_TEMP/deployed.gs" "$live/Code.gs" | head -200 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Same for the manifest, compared as JSON.
+          norm() { node -e 'const s=o=>Array.isArray(o)?o.map(s):o&&typeof o==="object"?Object.keys(o).sort().reduce((a,k)=>(a[k]=s(o[k]),a),{}):o;
+                            process.stdout.write(JSON.stringify(s(JSON.parse(require("fs").readFileSync(0,"utf8")))))'; }
+          live_m=$(norm < "$live/appsscript.json")
+          repo_m=$(norm < appsscript.json)
+          dep_m=$(git show "$base:appsscript.json" 2>/dev/null | norm || true)
+          if [ "$live_m" != "$repo_m" ] && [ "$live_m" != "$dep_m" ]; then
+            problems+=("appsscript.json differs from this repo. Live manifest: $live_m")
+          fi
+
+          if [ ${#problems[@]} -gt 0 ]; then
+            for p in "${problems[@]}"; do echo "::error::$p"; done
+            if [ "$OVERWRITE" = "true" ]; then
+              echo "::warning::Overwriting the live project anyway, as requested."
+            else
+              echo "::error::Nothing was deployed. Copy the live edits into this repo, or re-run this workflow by hand with 'overwrite live edits' ticked."
+              exit 1
+            fi
+          fi
+          echo "Live project matches the last deployed version."
+
+      - name: Push to Apps Script
+        run: clasp push --force
+
+      - name: Record what is live
+        run: |
+          git tag -f deployed HEAD
+          git push -f origin refs/tags/deployed
+          echo "Deployed $(git rev-parse --short HEAD) to Apps Script." >> "$GITHUB_STEP_SUMMARY"
