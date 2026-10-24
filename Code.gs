@@ -121,6 +121,9 @@ const LOG_HEADERS = [
 
 const RAW_HEADERS = ['Measured at (UTC)', 'Measured at (UK)', 'Channel value'];
 
+// First column of each chart's data block on the Chart Data sheet (blank column between blocks)
+const CHART_COLS = { HOURLY: 1, RUN: 5, PULSES: 9 };
+
 // ============================================================================================
 // MENU
 // ============================================================================================
@@ -137,6 +140,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Run check for last night now', 'runNightlyCheckManual')
     .addItem('Refresh dashboard', 'refreshDashboard')
+    .addItem('Check dashboard charts (to Diagnostics sheet)', 'checkDashboardCharts')
     .addItem('Remove daily trigger', 'removeTriggers')
     .addToUi();
 }
@@ -797,7 +801,7 @@ function buildDashboard_() {
   const prevDay = dayWindow_(shiftDate_(dateStr, -1));
   const hourly = hourlyBuckets_(dedupeSort_(samples), prevDay.start.getTime(), prevDay.end.getTime());
 
-  // ---- Chart data (hidden sheet)
+  // ---- Chart data: one contiguous block per chart, so each chart reads a single plain range.
   const cd = getSheet_(CONFIG.SHEET_CHART);
   cd.clear();
   const hourRows = hourly.map(h => {
@@ -806,22 +810,20 @@ function buildDashboard_() {
     const v = h.pulses == null ? '' : h.pulses;
     return [hh.substring(0, 2), night ? v : '', night ? '' : v];
   });
-  cd.getRange(1, 1, 1, 3).setValues([['Hour', 'Night window', 'Daytime']]);
-  cd.getRange(2, 1, hourRows.length, 1).setNumberFormat('@');
-  cd.getRange(2, 1, hourRows.length, 3).setValues(hourRows);
-
-  const nights = rows.slice().reverse().map(x => [
-    fmtLocal_(Utilities.parseDate(x[0] + ' 12:00', CONFIG.TIMEZONE, 'yyyy-MM-dd HH:mm'), 'EEE d MMM'),
-    x[3] === '' ? '' : Number(x[3]),
-    CONFIG.CLEAR_MIN_ZERO_RUN_MINUTES,
-    x[4] === '' ? '' : Number(x[4]),
-  ]);
-  cd.getRange(1, 5, 1, 4).setValues([['Night', 'Longest zero-flow run (min)', 'CLEAR threshold', 'Night pulses']]);
-  cd.getRange(2, 5, nights.length, 1).setNumberFormat('@');
-  cd.getRange(2, 5, nights.length, 4).setValues(nights);
-  // Charts drawn by a script ignore hidden rows by default, so this tab stays visible (at the end).
+  const nightRows = rows.slice().reverse().map(x => ({
+    label: fmtLocal_(Utilities.parseDate(x[0] + ' 12:00', CONFIG.TIMEZONE, 'yyyy-MM-dd HH:mm'), 'EEE d MMM'),
+    run: x[3] === '' ? '' : Number(x[3]),
+    pulses: x[4] === '' ? '' : Number(x[4]),
+  }));
+  const hourBlock = writeChartBlock_(cd, CHART_COLS.HOURLY, ['Hour', 'Night window', 'Daytime'], hourRows);
+  const runBlock = writeChartBlock_(cd, CHART_COLS.RUN, ['Night', 'Longest zero-flow run (min)', 'CLEAR threshold'],
+    nightRows.map(n => [n.label, n.run, CONFIG.CLEAR_MIN_ZERO_RUN_MINUTES]));
+  const pulseBlock = writeChartBlock_(cd, CHART_COLS.PULSES, ['Night', 'Night pulses'],
+    nightRows.map(n => [n.label, n.pulses]));
   if (cd.isSheetHidden()) cd.showSheet();
   cd.setTabColor('#B0BEC5');
+  // Commit the chart data before any chart is created on top of it.
+  SpreadsheetApp.flush();
 
   // ---- Dashboard canvas
   const dash = getSheet_(CONFIG.SHEET_DASH);
@@ -885,49 +887,51 @@ function buildDashboard_() {
   // Section headings
   dash.getRange('B13:I13').merge().setValue('Hour by hour  ·  ' + fmtLocal_(prevDay.start, 'EEEE d MMMM'))
     .setFontSize(12).setFontWeight('bold').setFontColor(THEME.NAVY);
-  dash.getRange('B30:I30').merge().setValue('Night by night  ·  last ' + nights.length + (nights.length === 1 ? ' night' : ' nights'))
+  dash.getRange('B30:I30').merge().setValue('Night by night  ·  last ' + nightRows.length + (nightRows.length === 1 ? ' night' : ' nights'))
     .setFontSize(12).setFontWeight('bold').setFontColor(THEME.NAVY);
 
-  const base = (b) => b.setHiddenDimensionStrategy(Charts.ChartHiddenDimensionStrategy.SHOW_BOTH)
-    .setOption('fontName', THEME.FONT).setOption('backgroundColor', '#FFFFFF')
+  // Only options that Sheets' own chart editor can represent, so none is silently dropped or
+  // breaks rendering: no 'transparent' colours, no dash arrays, explicit domain column.
+  const axisText = { color: THEME.MUTED, fontSize: 10 };
+  const chart = (type, range, w, h, row, col, offsetX) => dash.newChart()
+    .setChartType(type)
+    .addRange(range)
+    .setNumHeaders(1)
+    .setTransposeRowsAndColumns(false)
+    .setHiddenDimensionStrategy(Charts.ChartHiddenDimensionStrategy.SHOW_BOTH)
+    .setOption('useFirstColumnAsDomain', true)
+    .setOption('fontName', THEME.FONT)
+    .setOption('backgroundColor', '#FFFFFF')
     .setOption('titleTextStyle', { color: THEME.INK, fontSize: 12, bold: true })
-    .setOption('legend', { position: 'bottom', textStyle: { color: THEME.MUTED, fontSize: 10 } })
-    .setOption('hAxis', { textStyle: { color: THEME.MUTED, fontSize: 10 }, gridlines: { color: 'transparent' } })
-    .setOption('vAxis', { textStyle: { color: THEME.MUTED, fontSize: 10 }, gridlines: { color: THEME.RULE }, minValue: 0 });
+    .setOption('legend', { position: 'bottom', textStyle: axisText })
+    .setOption('hAxis', { textStyle: axisText })
+    .setOption('vAxis', { textStyle: axisText, gridlines: { color: THEME.RULE }, viewWindow: { min: 0 } })
+    .setOption('width', w)
+    .setOption('height', h)
+    .setPosition(row, col, offsetX, 4);
 
   // Hourly profile
-  dash.insertChart(base(dash.newChart().setChartType(Charts.ChartType.COLUMN)
-    .addRange(cd.getRange(1, 1, hourRows.length + 1, 3))
-    .setNumHeaders(1)
+  dash.insertChart(chart(Charts.ChartType.COLUMN, hourBlock, 912, 300, 14, 2, 0)
     .setOption('isStacked', true)
     .setOption('colors', [THEME.NAVY, THEME.TEAL_LIGHT])
-    .setOption('bar', { groupWidth: '80%' })
-    .setOption('chartArea', { left: 50, top: 20, width: '90%', height: '70%' })
-    .setOption('width', 912).setOption('height', 300)
-    .setPosition(14, 2, 0, 4)).build());
+    .build());
 
-  // Longest zero-flow run vs threshold
-  dash.insertChart(base(dash.newChart().setChartType(Charts.ChartType.COMBO)
-    .addRange(cd.getRange(1, 5, nights.length + 1, 3))
-    .setNumHeaders(1)
+  // Longest zero-flow run vs CLEAR threshold
+  dash.insertChart(chart(Charts.ChartType.COMBO, runBlock, 452, 300, 31, 2, 0)
     .setOption('title', 'Longest zero-flow run (min)')
     .setOption('seriesType', 'bars')
-    .setOption('series', { 0: { color: THEME.TEAL }, 1: { type: 'line', color: STATUS.LEAK.colour, lineDashStyle: [6, 4], lineWidth: 2 } })
-    .setOption('chartArea', { left: 45, top: 36, width: '82%', height: '62%' })
-    .setOption('width', 452).setOption('height', 300)
-    .setPosition(31, 2, 0, 4)).build());
+    .setOption('series', {
+      0: { type: 'bars', color: THEME.TEAL },
+      1: { type: 'line', color: STATUS.LEAK.colour, lineWidth: 2, pointSize: 0 },
+    })
+    .build());
 
   // Night pulses
-  dash.insertChart(base(dash.newChart().setChartType(Charts.ChartType.COLUMN)
-    .addRange(cd.getRange(1, 5, nights.length + 1, 1))
-    .addRange(cd.getRange(1, 8, nights.length + 1, 1))
-    .setNumHeaders(1)
+  dash.insertChart(chart(Charts.ChartType.COLUMN, pulseBlock, 452, 300, 31, 6, 4)
     .setOption('title', 'Pulses in night window')
     .setOption('colors', [THEME.NAVY])
     .setOption('legend', { position: 'none' })
-    .setOption('chartArea', { left: 45, top: 36, width: '82%', height: '62%' })
-    .setOption('width', 452).setOption('height', 300)
-    .setPosition(31, 6, 4, 4)).build());
+    .build());
 
   // Footer
   dash.getRange('B47:I47').merge()
@@ -949,6 +953,48 @@ function buildDashboard_() {
     if (sh) { ss.setActiveSheet(sh); ss.moveActiveSheet(ss.getNumSheets()); }
   });
   ss.setActiveSheet(dash);
+}
+
+/**
+ * Writes a header row and data rows to the Chart Data sheet starting at column `col`.
+ * The label column is stored as plain text so "00"–"23" and "Thu 22 Oct" stay category labels.
+ * Returns the whole block (headers included) for the chart to read.
+ */
+function writeChartBlock_(sh, col, headers, rows) {
+  sh.getRange(1, col, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  if (rows.length) {
+    sh.getRange(2, col, rows.length, 1).setNumberFormat('@');
+    sh.getRange(2, col + 1, rows.length, headers.length - 1).setNumberFormat('0');
+    sh.getRange(2, col, rows.length, headers.length).setValues(rows);
+  }
+  return sh.getRange(1, col, rows.length + 1, headers.length);
+}
+
+/**
+ * Lists every chart on the Dashboard with the range it reads and how many numbers that range
+ * holds, so a blank chart can be traced to its data or to its settings.
+ */
+function checkDashboardCharts() {
+  const charts = getSheet_(CONFIG.SHEET_DASH).getCharts();
+  const out = [['Chart', 'Type', 'Data range', 'Numeric cells', 'Title', 'Stacked', 'Colours']];
+  charts.forEach((c, i) => {
+    const opts = c.getOptions();
+    const get = k => { try { const v = opts.get(k); return v == null ? '' : JSON.stringify(v); } catch (e) { return ''; } };
+    c.getRanges().forEach(r => {
+      const numeric = r.getValues().slice(1).reduce((n, row) =>
+        n + row.slice(1).filter(v => typeof v === 'number').length, 0);
+      out.push([i + 1, String(c.modify().getChartType()), "'" + r.getSheet().getName() + "'!" + r.getA1Notation(),
+        numeric, get('title'), get('isStacked'), get('colors')]);
+    });
+  });
+  if (out.length === 1) out.push(['—', 'No charts on the Dashboard', '', '', '', '', '']);
+
+  const sh = getSheet_(CONFIG.SHEET_DIAG);
+  sh.clear();
+  sh.getRange(1, 1, 1, 2).setValues([['Dashboard chart check', fmtLocal_(new Date(), 'yyyy-MM-dd HH:mm:ss')]]).setFontWeight('bold');
+  sh.getRange(3, 1, out.length, out[0].length).setValues(out);
+  sh.getRange(3, 1, 1, out[0].length).setFontWeight('bold');
+  SpreadsheetApp.getUi().alert(charts.length + ' chart(s) checked. Details are on the Diagnostics sheet.');
 }
 
 // ============================================================================================
